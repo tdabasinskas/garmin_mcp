@@ -1107,6 +1107,7 @@ async def test_create_course_from_waypoints_preview_lists_course_points(app_with
     [
         ({"lat": 54.1, "lon": 23.1, "type": "WATER"}, "also needs a name"),
         ({"lat": 54.1, "lon": 23.1, "note": "Gate"}, "also needs a name"),
+        ({"lat": 54.1, "lon": 23.1, "rest_minutes": 10}, "also needs a name"),
     ],
 )
 async def test_create_course_from_waypoints_rejects_bad_course_points(
@@ -1118,4 +1119,47 @@ async def test_create_course_from_waypoints_rejects_bad_course_points(
     )
 
     assert message in _result_text(result)
+    mock_garmin_client.client.post.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_course_from_waypoints_rest_and_cutoff(app_with_courses, mock_garmin_client):
+    """rest_minutes and cutoff_minutes are stored as seconds on the course point."""
+    mock_garmin_client.client.post.side_effect = _post_router(
+        legs=[], elevations=(1.0, 2.0), saved={"courseId": 3}
+    )
+
+    await app_with_courses.call_tool(
+        "create_course_from_waypoints",
+        {
+            "waypoints": [
+                [54.0, 23.0],
+                {"lat": 54.01, "lon": 23.0, "name": "Cafe", "type": "COFFEE_SHOP", "rest_minutes": 20, "cutoff_minutes": 90},
+            ],
+            "course_name": "X",
+            "route_type": "freehand",
+        },
+    )
+
+    point = mock_garmin_client.client.post.call_args_list[-1].kwargs["json"]["coursePoints"][0]
+    assert point["restDuration"] == 1200
+    assert point["cutoffDuration"] == 5400
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra,message",
+    [
+        ({"name": "X", "rest_minutes": 0}, "greater than or equal to 1"),
+        ({"name": "X", "cutoff_minutes": 6000}, "less than or equal to 5999"),
+    ],
+)
+async def test_create_course_from_waypoints_duration_limits(
+    app_with_courses, mock_garmin_client, extra, message
+):
+    with pytest.raises(Exception, match=message):
+        await app_with_courses.call_tool(
+            "create_course_from_waypoints",
+            {"waypoints": [[54.0, 23.0], {"lat": 54.1, "lon": 23.1, **extra}], "course_name": "X"},
+        )
     mock_garmin_client.client.post.assert_not_called()
