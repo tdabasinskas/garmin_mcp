@@ -14,8 +14,10 @@ import os
 import pathlib
 import random
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 from urllib.parse import urlencode
+
+from pydantic import AliasChoices, BaseModel, Field
 from xml.sax.saxutils import escape
 
 from garmin_mcp.activity_analysis import _resolve_download_dir
@@ -200,6 +202,35 @@ _COURSE_POINT_TYPES = frozenset(
 # The Creator's limits; devices show at most 15 characters of a point's name.
 _COURSE_POINT_NAME_MAX = 15
 _COURSE_POINT_NOTE_MAX = 250
+# Garmin rejects longer course names and descriptions.
+_COURSE_NAME_MAX = 128
+_COURSE_DESCRIPTION_MAX = 512
+
+CourseName = Annotated[str, Field(min_length=1, max_length=_COURSE_NAME_MAX)]
+CourseDescription = Annotated[Optional[str], Field(max_length=_COURSE_DESCRIPTION_MAX)]
+
+
+class Waypoint(BaseModel):
+    """A route waypoint; with a name it is also a course point on the watch."""
+
+    latitude: float = Field(
+        ge=-90, le=90, validation_alias=AliasChoices("latitude", "lat")
+    )
+    longitude: float = Field(
+        ge=-180, le=180, validation_alias=AliasChoices("longitude", "lon", "lng")
+    )
+    name: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=_COURSE_POINT_NAME_MAX,
+        description="Course point name shown on the watch (devices show 15 characters).",
+    )
+    type: Optional[Literal[tuple(sorted(_COURSE_POINT_TYPES))]] = Field(
+        None, description="Course point type; GENERIC when a name is given without one."
+    )
+    note: Optional[str] = Field(
+        None, max_length=_COURSE_POINT_NOTE_MAX, description="Course point description."
+    )
 
 
 def _avoid_params(
@@ -245,9 +276,10 @@ def _parse_course_point(item: Dict[str, Any]) -> Optional[Dict[str, str]]:
         )
     note = (item.get("note") or "").strip()
     if len(name) > _COURSE_POINT_NAME_MAX:
-        # Keep the full name where the device can still show it.
-        note = f"{name}. {note}" if note else name
-        name = name[:_COURSE_POINT_NAME_MAX].rstrip()
+        raise ValueError(
+            f"course point name '{name}' is over {_COURSE_POINT_NAME_MAX} characters, "
+            "the most a watch shows; shorten it and put the full name in the note"
+        )
     if len(note) > _COURSE_POINT_NOTE_MAX:
         raise ValueError(f"a course point note is at most {_COURSE_POINT_NOTE_MAX} characters")
     return {"name": name, "type": point_type, "note": note}
@@ -262,6 +294,8 @@ def _parse_waypoints(waypoints: List[Any]) -> List[Dict[str, Any]]:
     points = []
     for item in waypoints:
         course_point = None
+        if isinstance(item, Waypoint):
+            item = item.model_dump()
         if isinstance(item, dict):
             lat = item.get("latitude", item.get("lat"))
             lon = item.get("longitude", item.get("lon", item.get("lng")))
@@ -724,14 +758,17 @@ def register_tools(app):
 
     @app.tool()
     async def create_course_from_waypoints(
-        waypoints: List[Any],
-        course_name: str,
+        waypoints: Annotated[
+            List[Union[Tuple[float, float], Waypoint]],
+            Field(min_length=2, max_length=_MAX_WAYPOINTS),
+        ],
+        course_name: CourseName,
         activity_type: str = "running",
         route_type: str = "popular",
         avoid_unpaved_roads: bool = False,
         avoid_high_traffic_roads: bool = False,
         avoid_road_closures: bool = False,
-        description: Optional[str] = None,
+        description: CourseDescription = None,
         save: bool = True,
     ) -> str:
         """Create a Garmin Connect Course routed through waypoints
@@ -743,13 +780,13 @@ def register_tools(app):
         Args:
             waypoints: Start, optional via points and end, as [[lat, lon], ...]
                 or [{"latitude": .., "longitude": ..}, ...]; 2 to 25 points.
-                Repeat the start at the end for a loop. A dict waypoint with
-                a "name" also becomes a course point, which the watch shows by
-                name and announces on approach; optional "type" (GENERIC by
-                default, e.g. WATER, FOOD, SUMMIT, ATTRACTION, COFFEE_SHOP,
-                DANGER) and "note" (up to 250 characters). Devices show 15
-                characters of a name; a longer one is cut there and kept in
-                full in the note.
+                Repeat the start at the end for a loop. A waypoint object
+                with a "name" (at most 15 characters, all a watch shows) also
+                becomes a course point, which the watch shows by name and
+                announces on approach; optional "type" (GENERIC by default,
+                e.g. WATER, FOOD, SUMMIT, ATTRACTION, PARK, COFFEE_SHOP,
+                DANGER) and "note" (at most 250 characters, a good place for
+                a longer name).
             course_name: Name of the course. Max 128 characters.
             activity_type: One of running, trail_running, obstacle_run,
                 hiking, road_biking, gravel_cycling, mountain_biking or other.
@@ -834,7 +871,7 @@ def register_tools(app):
         start_latitude: float,
         start_longitude: float,
         distance_km: float,
-        course_name: str,
+        course_name: CourseName,
         activity_type: str = "running",
         direction: str = "random",
         route_type: str = "popular",
@@ -842,7 +879,7 @@ def register_tools(app):
         avoid_high_traffic_roads: bool = False,
         avoid_road_closures: bool = False,
         alternative: int = 1,
-        description: Optional[str] = None,
+        description: CourseDescription = None,
         save: bool = True,
     ) -> str:
         """Create a loop course of about a given length from a start point

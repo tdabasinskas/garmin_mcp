@@ -775,8 +775,6 @@ async def test_create_course_from_waypoints_freehand_skips_routing(app_with_cour
 @pytest.mark.parametrize(
     "args,message",
     [
-        ({"waypoints": [[54.0, 23.0]]}, "at least two waypoints"),
-        ({"waypoints": [[54.0, 23.0]] * 26}, "at most 25 waypoints"),
         ({"waypoints": [[95.0, 23.0], [54.0, 23.0]]}, "out of range"),
         ({"waypoints": [[54.0, 23.0], [54.1, 23.1]], "route_type": "scenic"}, "unknown route_type"),
         ({"waypoints": [[54.0, 23.0], [54.1, 23.1]], "route_type": "free_flow"}, "only available for cycling"),
@@ -791,6 +789,28 @@ async def test_create_course_from_waypoints_rejects_bad_input(
     )
 
     assert message in _result_text(result)
+    mock_garmin_client.client.post.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "args,message",
+    [
+        ({"waypoints": [[54.0, 23.0]]}, "at least 2 items"),
+        ({"waypoints": [[54.0, 23.0]] * 26}, "at most 25 items"),
+        ({"waypoints": [[54.0, 23.0], {"lat": 54.1, "lon": 23.1, "name": "Pažaislio vienuolynas"}]}, "at most 15 characters"),
+        ({"waypoints": [[54.0, 23.0], {"lat": 54.1, "lon": 23.1, "name": "X", "note": "n" * 251}]}, "at most 250 characters"),
+        ({"waypoints": [[54.0, 23.0], {"lat": 54.1, "lon": 23.1, "name": "X", "type": "CASTLE"}]}, "Input should be"),
+        ({"waypoints": [[54.0, 23.0], [54.1, 23.1]], "course_name": "n" * 129}, "at most 128 characters"),
+        ({"waypoints": [[54.0, 23.0], [54.1, 23.1]], "description": "d" * 513}, "at most 512 characters"),
+    ],
+)
+async def test_create_course_from_waypoints_schema_limits(
+    app_with_courses, mock_garmin_client, args, message
+):
+    """Limits are in the input schema, so clients see them and the server enforces them."""
+    with pytest.raises(Exception, match=message):
+        await app_with_courses.call_tool("create_course_from_waypoints", {"course_name": "X", **args})
     mock_garmin_client.client.post.assert_not_called()
 
 
@@ -972,7 +992,7 @@ async def test_create_course_from_waypoints_named_course_points(app_with_courses
         {
             "waypoints": [
                 {"lat": 54.0, "lon": 23.0, "name": "Start"},
-                {"lat": 54.0021, "lon": 23.0001, "name": "Pažaislio vienuolynas", "type": "attraction"},
+                {"lat": 54.0021, "lon": 23.0001, "name": "Pažaislis", "type": "ATTRACTION", "note": "Pažaislio vienuolynas"},
                 [54.003, 23.0],
             ],
             "course_name": "POI walk",
@@ -982,7 +1002,7 @@ async def test_create_course_from_waypoints_named_course_points(app_with_courses
     data = json.loads(_result_text(result))
     assert data["course_points_count"] == 2
     points = mock_garmin_client.client.post.call_args_list[-1].kwargs["json"]["coursePoints"]
-    assert [p["name"] for p in points] == ["Start", "Pažaislio vienu"]
+    assert [p["name"] for p in points] == ["Start", "Pažaislis"]
     assert points[1]["coursePointType"] == "ATTRACTION"
     assert points[1]["note"] == "Pažaislio vienuolynas"
     assert points[1]["lat"] == 54.0021  # the stop's own position, not the snapped one
@@ -1016,9 +1036,8 @@ async def test_create_course_from_waypoints_preview_lists_course_points(app_with
 @pytest.mark.parametrize(
     "waypoint,message",
     [
-        ({"lat": 54.1, "lon": 23.1, "name": "X", "type": "CASTLE"}, "unknown course point type 'CASTLE'"),
         ({"lat": 54.1, "lon": 23.1, "type": "WATER"}, "also needs a name"),
-        ({"lat": 54.1, "lon": 23.1, "name": "X", "note": "n" * 251}, "at most 250 characters"),
+        ({"lat": 54.1, "lon": 23.1, "note": "Gate"}, "also needs a name"),
     ],
 )
 async def test_create_course_from_waypoints_rejects_bad_course_points(
