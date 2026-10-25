@@ -430,4 +430,106 @@ def register_tools(app):
                 "message": f"Failed to push workout: {str(e)}",
             }, indent=2)
 
+    @app.tool()
+    async def push_course_to_device(
+        course_id: int, device_id: Optional[int] = None
+    ) -> str:
+        """Send a course to a Garmin device
+
+        Queues the course in Garmin Connect's device message queue, the same
+        as "Send to Device" on a course in Garmin Connect. The watch picks it
+        up at its next sync with Garmin Connect (phone app or Wi-Fi), so it
+        does not appear on the watch immediately. The course goes with its
+        elevation and course points.
+
+        Each call queues another copy, so do not push the same course twice.
+
+        Args:
+            course_id: ID of the course to send (from get_courses,
+                upload_course or the course creation tools)
+            device_id: Device ID (optional; defaults to the most recently used
+                device; can be obtained from get_devices or get_device_last_used)
+        """
+        try:
+            if device_id is None:
+                last_used = garmin_client.get_device_last_used()
+                device_id = (last_used or {}).get("userDeviceId")
+                if not device_id:
+                    return json.dumps({
+                        "status": "failed",
+                        "course_id": course_id,
+                        "message": (
+                            "No default device found. Pass device_id explicitly "
+                            "(see get_devices)."
+                        ),
+                    }, indent=2)
+
+            # The device says whether it takes courses and in which format.
+            device = next(
+                (
+                    d for d in (garmin_client.get_devices() or [])
+                    if d.get("deviceId") == device_id
+                ),
+                {},
+            )
+            if device and not device.get("courseCapable"):
+                return json.dumps({
+                    "status": "failed",
+                    "course_id": course_id,
+                    "device_id": device_id,
+                    "message": (
+                        f"{device.get('productDisplayName') or device_id} "
+                        "does not support courses."
+                    ),
+                }, indent=2)
+            file_type = device.get("courseFileType") or "FIT"
+
+            # Garmin's message queue shows this name on the device.
+            course = garmin_client.client.connectapi(
+                f"/course-service/course/{course_id}"
+            ) or {}
+            course_name = course.get("courseName") or f"Course {course_id}"
+
+            payload = [{
+                "deviceId": device_id,
+                "messageUrl": (
+                    f"course-service/course/{file_type.lower()}/{course_id}/"
+                    f"{device_id}?elevation=true"
+                ),
+                "messageType": "courses",
+                "groupName": None,
+                "messageName": course_name,
+                "priority": 0,
+                "fileType": file_type,
+                "metaDataId": course_id,
+            }]
+            url = "device-service/devicemessage/messages"
+            response = garmin_client.client.post("connectapi", url, json=payload)
+
+            if response.status_code in (200, 204):
+                return json.dumps({
+                    "status": "success",
+                    "course_id": course_id,
+                    "course_name": course_name,
+                    "device_id": device_id,
+                    "message": (
+                        f"Queued course {course_id} for device {device_id}; "
+                        "it arrives on the device at its next sync"
+                    ),
+                }, indent=2)
+            return json.dumps({
+                "status": "failed",
+                "course_id": course_id,
+                "device_id": device_id,
+                "http_status": response.status_code,
+                "message": f"Failed to push course: HTTP {response.status_code}",
+            }, indent=2)
+        except Exception as e:
+            return json.dumps({
+                "status": "failed",
+                "course_id": course_id,
+                "device_id": device_id,
+                "message": f"Failed to push course: {str(e)}",
+            }, indent=2)
+
     return app

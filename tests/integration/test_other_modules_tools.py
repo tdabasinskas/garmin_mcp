@@ -1246,3 +1246,74 @@ async def test_menstrual_calendar_deduplicates_cycles_crossing_chunk_seam(
 
     assert json.loads(result[0][0].text) == wrap([before, spanning, after])
     assert mock_garmin_client.get_menstrual_calendar_data.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_push_course_to_device_queues_course_message(app_with_devices, mock_garmin_client):
+    """The course is queued as the Course Creator's "Send to Device" does"""
+    mock_garmin_client.get_devices.return_value = [
+        {"deviceId": 3456789012, "productDisplayName": "fenix 8", "courseCapable": True, "courseFileType": "FIT"}
+    ]
+    mock_garmin_client.client.connectapi.return_value = {"courseId": 77, "courseName": "Old Town"}
+    mock_garmin_client.client.post.return_value = Mock(status_code=200)
+
+    result = await app_with_devices.call_tool(
+        "push_course_to_device", {"course_id": 77, "device_id": 3456789012}
+    )
+
+    data = json.loads(result[0][0].text)
+    assert data["status"] == "success"
+    assert data["course_name"] == "Old Town"
+    args, kwargs = mock_garmin_client.client.post.call_args
+    assert args == ("connectapi", "device-service/devicemessage/messages")
+    assert kwargs["json"] == [{
+        "deviceId": 3456789012,
+        "messageUrl": "course-service/course/fit/77/3456789012?elevation=true",
+        "messageType": "courses",
+        "groupName": None,
+        "messageName": "Old Town",
+        "priority": 0,
+        "fileType": "FIT",
+        "metaDataId": 77,
+    }]
+
+
+@pytest.mark.asyncio
+async def test_push_course_to_device_defaults_to_last_used(app_with_devices, mock_garmin_client):
+    mock_garmin_client.get_device_last_used.return_value = MOCK_DEVICE_LAST_USED
+    mock_garmin_client.get_devices.return_value = []
+    mock_garmin_client.client.connectapi.return_value = {"courseName": "Loop"}
+    mock_garmin_client.client.post.return_value = Mock(status_code=200)
+
+    result = await app_with_devices.call_tool("push_course_to_device", {"course_id": 5})
+
+    data = json.loads(result[0][0].text)
+    assert data["device_id"] == MOCK_DEVICE_LAST_USED["userDeviceId"]
+    assert mock_garmin_client.client.post.call_args.kwargs["json"][0]["fileType"] == "FIT"
+
+
+@pytest.mark.asyncio
+async def test_push_course_to_device_refuses_device_without_courses(app_with_devices, mock_garmin_client):
+    mock_garmin_client.get_devices.return_value = [
+        {"deviceId": 1, "productDisplayName": "Index S2 Smart Scale", "courseCapable": False}
+    ]
+
+    result = await app_with_devices.call_tool("push_course_to_device", {"course_id": 5, "device_id": 1})
+
+    data = json.loads(result[0][0].text)
+    assert data["status"] == "failed"
+    assert "does not support courses" in data["message"]
+    mock_garmin_client.client.post.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_push_course_to_device_error(app_with_devices, mock_garmin_client):
+    mock_garmin_client.get_devices.return_value = []
+    mock_garmin_client.client.connectapi.return_value = {"courseName": "Loop"}
+    mock_garmin_client.client.post.side_effect = GarminConnectConnectionError("API Error 404")
+
+    result = await app_with_devices.call_tool("push_course_to_device", {"course_id": 5, "device_id": 2})
+
+    data = json.loads(result[0][0].text)
+    assert data["status"] == "failed"
+    assert "API Error 404" in data["message"]
