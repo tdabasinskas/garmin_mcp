@@ -283,13 +283,29 @@ def _route_summary(points: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _save_course(client, points, course_name, activity_type_id, description) -> Dict[str, Any]:
+def _save_course(
+    client,
+    points,
+    course_name,
+    activity_type_id,
+    description,
+    elevation_gain: Optional[float] = None,
+    elevation_loss: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Save routed points as a course.  Garmin stores the climb it is sent
+    rather than working it out, so it is filled in here."""
+    if elevation_gain is None or elevation_loss is None:
+        summary = _route_summary(points)
+        elevation_gain = summary["elevation_gain_m"]
+        elevation_loss = summary["elevation_loss_m"]
     payload = _build_course_payload(
         {"geoPoints": points},
         course_name=course_name,
         activity_type_id=activity_type_id,
         description=description,
     )
+    payload["elevationGainMeter"] = elevation_gain
+    payload["elevationLossMeter"] = elevation_loss
     saved = client.client.post("connectapi", "/course-service/course", json=payload, api=True)
     return {
         "status": "success",
@@ -798,7 +814,16 @@ def register_tools(app):
                 }
                 for p in loops[alternative - 1]["geoPoints"]
             ]
-            result = _save_course(garmin_client, points, course_name, activity_type_id, description)
+            chosen = loops[alternative - 1]
+            result = _save_course(
+                garmin_client,
+                points,
+                course_name,
+                activity_type_id,
+                description,
+                elevation_gain=chosen.get("elevationGainMeter"),
+                elevation_loss=chosen.get("elevationLossMeter"),
+            )
             result["direction"] = direction
             return json.dumps(result, indent=2)
         except ValueError as e:
