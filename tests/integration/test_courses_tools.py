@@ -923,3 +923,31 @@ async def test_create_round_trip_course_alternative_out_of_range(app_with_course
 
     assert "alternative must be between 1 and 2" in _result_text(result)
     mock_garmin_client.client.post.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "activity_type,course_type,type_id",
+    [("walking", "HIKING", 3), ("cycling", "ROAD_CYCLING", 10), ("other", "MIXED_SURFACE", 4)],
+)
+async def test_create_round_trip_course_activity_types(
+    app_with_courses, mock_garmin_client, activity_type, course_type, type_id
+):
+    """Each activity type routes with the Creator's profile and saves its course type."""
+    mock_garmin_client.client.connectapi.return_value = _LOOPS
+    mock_garmin_client.client.post.return_value = {"courseId": 9}
+
+    await app_with_courses.call_tool(
+        "create_round_trip_course",
+        {
+            "start_latitude": 54.0,
+            "start_longitude": 23.0,
+            "distance_km": 5,
+            "course_name": "Loop",
+            "activity_type": activity_type,
+            "direction": "north",
+        },
+    )
+
+    assert f"courseType={course_type}" in mock_garmin_client.client.connectapi.call_args.args[0]
+    assert mock_garmin_client.client.post.call_args.kwargs["json"]["activityTypePk"] == type_id
