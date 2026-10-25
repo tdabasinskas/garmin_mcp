@@ -12,8 +12,10 @@ import json
 import math
 import os
 import pathlib
+import random
 import sys
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode
 from xml.sax.saxutils import escape
 
 from garmin_mcp.activity_analysis import _resolve_download_dir
@@ -137,6 +139,167 @@ def _build_course_payload(
         "startBearing": bearing,
         "endBearing": None,
         "geoPoints": geo_points,
+    }
+
+
+# --- Course Creator routing -------------------------------------------------
+#
+# The Course Creator on connect.garmin.com routes over Garmin's own map with
+# these course-service endpoints; the tools below call them the same way.
+
+# Route types as named in the Course Creator, mapped to the API's routeType.
+_ROUTE_TYPES = {
+    "popular": "POPULARITY",  # "Most Popular": Garmin's popularity routing
+    "most_direct": "FOLLOW_ROADS",  # "Most Direct": shortest along roads
+    "least_elevation": "MIN_ASCENT",
+    "free_flow": "FREE_FLOW",  # cycling only: fewer stops and turns
+}
+_ROUND_TRIP_ROUTE_TYPES = ("popular", "least_elevation", "free_flow")
+_CYCLING_COURSE_TYPES = {"ROAD_CYCLING", "GRAVEL_BIKING", "MOUNTAIN_BIKING"}
+
+# activity_type -> routing courseType (the routing profile).  Garmin has no
+# walking profile, so walking routes as hiking.
+_ROUTING_COURSE_TYPES = {
+    "running": "RUNNING",
+    "trail_running": "TRAIL_RUNNING",
+    "hiking": "HIKING",
+    "walking": "HIKING",
+    "cycling": "ROAD_CYCLING",
+    "road_biking": "ROAD_CYCLING",
+    "mountain_biking": "MOUNTAIN_BIKING",
+    "gravel_cycling": "GRAVEL_BIKING",
+}
+
+_ROUND_TRIP_DIRECTIONS = ("north", "south", "east", "west", "tailwind")
+_MAX_WAYPOINTS = 25
+
+
+def _avoid_params(
+    avoid_unpaved_roads: bool, avoid_high_traffic_roads: bool, avoid_road_closures: bool
+) -> Dict[str, str]:
+    params = {}
+    if avoid_road_closures:
+        params["avoidRoadClosures"] = "true"
+    if avoid_unpaved_roads:
+        params["avoidUnpavedRoads"] = "true"
+    if avoid_high_traffic_roads:
+        params["avoidHighTrafficRoads"] = "true"
+    return params
+
+
+def _check_route_options(activity_type: str, route_type: str) -> tuple:
+    """(activity_type_id, routing course type) or raise ValueError."""
+    activity_type = activity_type.lower()
+    activity_type_id = _ACTIVITY_TYPE_IDS.get(activity_type)
+    if activity_type_id is None:
+        raise ValueError(
+            f"unknown activity_type '{activity_type}'. "
+            f"Supported: {', '.join(sorted(_ACTIVITY_TYPE_IDS))}."
+        )
+    course_type = _ROUTING_COURSE_TYPES[activity_type]
+    if route_type == "free_flow" and course_type not in _CYCLING_COURSE_TYPES:
+        raise ValueError("route_type 'free_flow' is only available for cycling activity types.")
+    return activity_type_id, course_type
+
+
+def _parse_waypoints(waypoints: List[Any]) -> List[Dict[str, float]]:
+    """Accept [[lat, lon], ...] or [{"latitude"/"lat", "longitude"/"lon"}, ...]."""
+    points = []
+    for item in waypoints:
+        if isinstance(item, dict):
+            lat = item.get("latitude", item.get("lat"))
+            lon = item.get("longitude", item.get("lon", item.get("lng")))
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            lat, lon = item[0], item[1]
+        else:
+            raise ValueError(f"waypoint {item!r} is not [lat, lon]")
+        lat, lon = float(lat), float(lon)
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            raise ValueError(f"waypoint ({lat}, {lon}) is out of range")
+        points.append({"latitude": lat, "longitude": lon})
+    if len(points) < 2:
+        raise ValueError("at least two waypoints (start and end) are needed")
+    if len(points) > _MAX_WAYPOINTS:
+        raise ValueError(f"at most {_MAX_WAYPOINTS} waypoints are supported")
+    return points
+
+
+def _route_leg(client, start, end, route_type: str, course_type: str, avoid: Dict[str, str]):
+    """Routed points for one leg, as [{"latitude", "longitude"}, ...]."""
+    query = urlencode({"routeType": route_type, "courseType": course_type, **avoid})
+    data = client.client.post(
+        "connectapi",
+        f"/course-service/course/route/v2?{query}",
+        json={
+            "startLat": start["latitude"],
+            "startLon": start["longitude"],
+            "endLat": end["latitude"],
+            "endLon": end["longitude"],
+            "deviceType": "WEB",
+        },
+        api=True,
+    )
+    points = [
+        {"latitude": p[0], "longitude": p[1]}
+        for segment in (data or {}).get("route") or []
+        for p in segment
+    ]
+    if not points:
+        raise ValueError(
+            "Garmin found no route between "
+            f"({start['latitude']}, {start['longitude']}) and ({end['latitude']}, {end['longitude']})"
+        )
+    return points
+
+
+def _with_elevation(client, points: List[Dict[str, float]]) -> List[Dict[str, float]]:
+    """Fill in elevations from Garmin's elevation service (as the Creator does)."""
+    data = client.client.post(
+        "connectapi",
+        "/course-service/course/elevation?smoothingEnabled=true",
+        json=[[p["latitude"], p["longitude"], None] for p in points],
+        api=True,
+    )
+    if isinstance(data, list) and len(data) == len(points):
+        for p, row in zip(points, data):
+            if isinstance(row, (list, tuple)) and len(row) >= 3 and row[2] is not None:
+                p["elevation"] = row[2]
+    return points
+
+
+def _route_summary(points: List[Dict[str, Any]]) -> Dict[str, Any]:
+    distance = sum(_haversine(points[i - 1], points[i]) for i in range(1, len(points)))
+    gain = loss = 0.0
+    for i in range(1, len(points)):
+        a, b = points[i - 1].get("elevation"), points[i].get("elevation")
+        if a is not None and b is not None:
+            gain += max(b - a, 0.0)
+            loss += max(a - b, 0.0)
+    return {
+        "distance_m": round(distance, 1),
+        "elevation_gain_m": round(gain, 1),
+        "elevation_loss_m": round(loss, 1),
+        "points_count": len(points),
+    }
+
+
+def _save_course(client, points, course_name, activity_type_id, description) -> Dict[str, Any]:
+    payload = _build_course_payload(
+        {"geoPoints": points},
+        course_name=course_name,
+        activity_type_id=activity_type_id,
+        description=description,
+    )
+    saved = client.client.post("connectapi", "/course-service/course", json=payload, api=True)
+    return {
+        "status": "success",
+        "course_id": saved.get("courseId"),
+        "name": saved.get("courseName"),
+        "distance_m": saved.get("distanceMeter"),
+        "elevation_gain_m": saved.get("elevationGainMeter"),
+        "elevation_loss_m": saved.get("elevationLossMeter"),
+        "activity_type_id": saved.get("activityTypePk"),
+        "url": f"https://connect.{client.client.domain}/modern/course/{saved.get('courseId')}",
     }
 
 
@@ -445,6 +608,203 @@ def register_tools(app):
 
         except Exception as e:
             return f"Error uploading course: {str(e)}"
+
+    @app.tool()
+    async def create_course_from_waypoints(
+        waypoints: List[Any],
+        course_name: str,
+        activity_type: str = "running",
+        route_type: str = "popular",
+        avoid_unpaved_roads: bool = False,
+        avoid_high_traffic_roads: bool = False,
+        avoid_road_closures: bool = False,
+        description: Optional[str] = None,
+        save: bool = True,
+    ) -> str:
+        """Create a Garmin Connect Course routed through waypoints
+
+        Works like the Course Creator on connect.garmin.com: each leg between
+        consecutive waypoints is routed over Garmin's map, and elevations come
+        from Garmin's elevation service.
+
+        Args:
+            waypoints: Start, optional via points and end, as [[lat, lon], ...]
+                or [{"latitude": .., "longitude": ..}, ...]; 2 to 25 points.
+                Repeat the start at the end for a loop.
+            course_name: Name of the course. Max 128 characters.
+            activity_type: One of running, cycling, hiking, walking,
+                trail_running, mountain_biking, road_biking, gravel_cycling.
+                It also picks the routing profile (walking routes as hiking).
+            route_type: popular (Garmin's popularity routing, the Creator's
+                default), most_direct (shortest along roads), least_elevation,
+                free_flow (cycling only: fewer stops and turns) or freehand
+                (straight lines between the waypoints, no routing).
+            avoid_unpaved_roads: Avoid unpaved roads.
+            avoid_high_traffic_roads: Avoid high-traffic roads.
+            avoid_road_closures: Avoid known road closures.
+            description: Optional description. Max 512 characters.
+            save: False returns the route's distance and climb without
+                creating the course.
+        """
+        try:
+            route_type = route_type.lower()
+            if route_type != "freehand" and route_type not in _ROUTE_TYPES:
+                return (
+                    f"Error: unknown route_type '{route_type}'. "
+                    f"Supported: {', '.join([*_ROUTE_TYPES, 'freehand'])}."
+                )
+            activity_type_id, course_type = _check_route_options(activity_type, route_type)
+            stops = _parse_waypoints(waypoints)
+
+            if route_type == "freehand":
+                points = [dict(p) for p in stops]
+            else:
+                avoid = _avoid_params(
+                    avoid_unpaved_roads, avoid_high_traffic_roads, avoid_road_closures
+                )
+                points = []
+                for start, end in zip(stops, stops[1:]):
+                    leg = _route_leg(
+                        garmin_client, start, end, _ROUTE_TYPES[route_type], course_type, avoid
+                    )
+                    if points and leg and points[-1] == leg[0]:
+                        leg = leg[1:]
+                    points.extend(leg)
+            points = _with_elevation(garmin_client, points)
+
+            if not save:
+                return json.dumps(
+                    {"status": "preview", "name": course_name, **_route_summary(points)},
+                    indent=2,
+                )
+            return json.dumps(
+                _save_course(garmin_client, points, course_name, activity_type_id, description),
+                indent=2,
+            )
+        except ValueError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            return f"Error creating course: {str(e)}"
+
+    @app.tool()
+    async def create_round_trip_course(
+        start_latitude: float,
+        start_longitude: float,
+        distance_km: float,
+        course_name: str,
+        activity_type: str = "running",
+        direction: str = "random",
+        route_type: str = "popular",
+        avoid_unpaved_roads: bool = False,
+        avoid_high_traffic_roads: bool = False,
+        avoid_road_closures: bool = False,
+        alternative: int = 1,
+        description: Optional[str] = None,
+        save: bool = True,
+    ) -> str:
+        """Create a loop course of about a given length from a start point
+
+        This is the Course Creator's automatic (round trip) mode. Garmin
+        proposes up to three loops; call with save=false to compare them, then
+        again with the chosen alternative and the direction the preview
+        reports.
+
+        Args:
+            start_latitude: Latitude of the start (and finish).
+            start_longitude: Longitude of the start (and finish).
+            distance_km: Wanted length in kilometres; Garmin's loops come out
+                near it, not exactly on it.
+            course_name: Name of the course. Max 128 characters.
+            activity_type: One of running, cycling, hiking, walking,
+                trail_running, mountain_biking, road_biking, gravel_cycling.
+            direction: north, south, east, west, tailwind (head out against
+                the wind, come back with it) or random.
+            route_type: popular, least_elevation or free_flow (cycling only).
+            avoid_unpaved_roads: Avoid unpaved roads.
+            avoid_high_traffic_roads: Avoid high-traffic roads.
+            avoid_road_closures: Avoid known road closures.
+            alternative: Which of Garmin's loops to save, 1-based.
+            description: Optional description. Max 512 characters.
+            save: False lists the proposed loops without creating a course.
+        """
+        try:
+            route_type = route_type.lower()
+            if route_type not in _ROUND_TRIP_ROUTE_TYPES:
+                return (
+                    f"Error: unknown route_type '{route_type}' for a round trip. "
+                    f"Supported: {', '.join(_ROUND_TRIP_ROUTE_TYPES)}."
+                )
+            direction = direction.lower()
+            if direction == "random":
+                direction = random.choice(_ROUND_TRIP_DIRECTIONS[:4])
+            if direction not in _ROUND_TRIP_DIRECTIONS:
+                return (
+                    f"Error: unknown direction '{direction}'. "
+                    f"Supported: {', '.join(_ROUND_TRIP_DIRECTIONS)}, random."
+                )
+            if not 0 < distance_km <= 500:
+                return "Error: distance_km must be between 0 and 500."
+            activity_type_id, course_type = _check_route_options(activity_type, route_type)
+            _parse_waypoints([[start_latitude, start_longitude]] * 2)
+
+            query = urlencode(
+                {
+                    "startLat": start_latitude,
+                    "startLon": start_longitude,
+                    "distance": int(distance_km * 1000),
+                    "direction": direction.upper(),
+                    "courseType": course_type,
+                    "routeType": _ROUTE_TYPES[route_type],
+                    **_avoid_params(
+                        avoid_unpaved_roads, avoid_high_traffic_roads, avoid_road_closures
+                    ),
+                }
+            )
+            data = garmin_client.client.connectapi(
+                f"/course-service/course/roundTripRoutes/multiple?{query}"
+            )
+            loops = [
+                c for c in (data or {}).get("roundTripRouteCourses") or [] if c.get("geoPoints")
+            ]
+            if not loops:
+                return "Error: Garmin proposed no loop from this start point."
+
+            if not save:
+                return json.dumps(
+                    {
+                        "status": "preview",
+                        "direction": direction,
+                        "alternatives": [
+                            {
+                                "alternative": i,
+                                "distance_m": round(c.get("distanceMeter") or 0, 1),
+                                "elevation_gain_m": round(c.get("elevationGainMeter") or 0, 1),
+                                "elevation_loss_m": round(c.get("elevationLossMeter") or 0, 1),
+                                "points_count": len(c["geoPoints"]),
+                            }
+                            for i, c in enumerate(loops, 1)
+                        ],
+                    },
+                    indent=2,
+                )
+
+            if not 1 <= alternative <= len(loops):
+                return f"Error: alternative must be between 1 and {len(loops)}."
+            points = [
+                {
+                    "latitude": p["latitude"],
+                    "longitude": p["longitude"],
+                    "elevation": p.get("elevation"),
+                }
+                for p in loops[alternative - 1]["geoPoints"]
+            ]
+            result = _save_course(garmin_client, points, course_name, activity_type_id, description)
+            result["direction"] = direction
+            return json.dumps(result, indent=2)
+        except ValueError as e:
+            return f"Error: {e}"
+        except Exception as e:
+            return f"Error creating round trip course: {str(e)}"
 
     @app.tool()
     async def delete_course(course_id: int, confirm: bool = False) -> str:

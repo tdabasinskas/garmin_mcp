@@ -653,3 +653,267 @@ def test_resolve_gpx_output_path():
     # 3. Default path
     resolved_default = _resolve_gpx_output_path(123)
     assert resolved_default.endswith("courses/123.gpx") or "123.gpx" in resolved_default
+
+
+# --- create_course_from_waypoints / create_round_trip_course ---------------
+
+def _leg(*points):
+    return {"route": [[list(p) for p in points]], "routeMessages": []}
+
+
+def _elevations(*values):
+    def respond(*args, **kwargs):
+        return [[lat, lon, values[i]] for i, (lat, lon, _) in enumerate(kwargs["json"])]
+    return respond
+
+
+def _post_router(legs, elevations, saved):
+    """Answer the routing, elevation and save calls in the order they arrive."""
+    legs = list(legs)
+
+    def post(_service, path, **kwargs):
+        if path.startswith("/course-service/course/route/v2"):
+            return legs.pop(0)
+        if path.startswith("/course-service/course/elevation"):
+            return _elevations(*elevations)(**kwargs)
+        if path == "/course-service/course":
+            return saved
+        raise AssertionError(f"unexpected POST {path}")
+
+    return post
+
+
+@pytest.mark.asyncio
+async def test_create_course_from_waypoints_routes_each_leg(app_with_courses, mock_garmin_client):
+    """Each leg is routed, legs are joined without repeating the shared point,
+    elevations are filled in and the course is saved."""
+    mock_garmin_client.client.post.side_effect = _post_router(
+        legs=[
+            _leg((54.0, 23.0), (54.001, 23.001), (54.002, 23.002)),
+            _leg((54.002, 23.002), (54.003, 23.003)),
+        ],
+        elevations=(10.0, 11.0, 12.0, 15.0),
+        saved={"courseId": 77, "courseName": "Old Town", "activityTypePk": 3},
+    )
+
+    result = await app_with_courses.call_tool(
+        "create_course_from_waypoints",
+        {
+            "waypoints": [[54.0, 23.0], {"lat": 54.002, "lon": 23.002}, [54.003, 23.003]],
+            "course_name": "Old Town",
+            "activity_type": "hiking",
+            "avoid_unpaved_roads": True,
+        },
+    )
+
+    data = json.loads(_result_text(result))
+    assert data["status"] == "success"
+    assert data["course_id"] == 77
+
+    calls = mock_garmin_client.client.post.call_args_list
+    route_calls = [c for c in calls if c.args[1].startswith("/course-service/course/route/v2")]
+    assert len(route_calls) == 2
+    assert "routeType=POPULARITY" in route_calls[0].args[1]
+    assert "courseType=HIKING" in route_calls[0].args[1]
+    assert "avoidUnpavedRoads=true" in route_calls[0].args[1]
+    assert route_calls[1].kwargs["json"]["startLat"] == 54.002
+
+    payload = calls[-1].kwargs["json"]
+    assert payload["courseName"] == "Old Town"
+    assert payload["activityTypePk"] == 3
+    assert [p["elevation"] for p in payload["geoPoints"]] == [10.0, 11.0, 12.0, 15.0]
+
+
+@pytest.mark.asyncio
+async def test_create_course_from_waypoints_preview_does_not_save(app_with_courses, mock_garmin_client):
+    """save=false reports distance and climb and creates nothing."""
+    mock_garmin_client.client.post.side_effect = _post_router(
+        legs=[_leg((54.0, 23.0), (54.01, 23.0))],
+        elevations=(10.0, 14.0),
+        saved=None,
+    )
+
+    result = await app_with_courses.call_tool(
+        "create_course_from_waypoints",
+        {"waypoints": [[54.0, 23.0], [54.01, 23.0]], "course_name": "Test", "save": False},
+    )
+
+    data = json.loads(_result_text(result))
+    assert data["status"] == "preview"
+    assert 1100 < data["distance_m"] < 1120
+    assert data["elevation_gain_m"] == 4.0
+    paths = [c.args[1] for c in mock_garmin_client.client.post.call_args_list]
+    assert "/course-service/course" not in paths
+
+
+@pytest.mark.asyncio
+async def test_create_course_from_waypoints_freehand_skips_routing(app_with_courses, mock_garmin_client):
+    """freehand uses the waypoints as they are."""
+    mock_garmin_client.client.post.side_effect = _post_router(
+        legs=[], elevations=(1.0, 2.0, 3.0), saved={"courseId": 5}
+    )
+
+    await app_with_courses.call_tool(
+        "create_course_from_waypoints",
+        {
+            "waypoints": [[54.0, 23.0], [54.1, 23.1], [54.2, 23.2]],
+            "course_name": "Straight",
+            "route_type": "freehand",
+        },
+    )
+
+    paths = [c.args[1] for c in mock_garmin_client.client.post.call_args_list]
+    assert not any(p.startswith("/course-service/course/route/v2") for p in paths)
+    assert len(mock_garmin_client.client.post.call_args_list[-1].kwargs["json"]["geoPoints"]) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "args,message",
+    [
+        ({"waypoints": [[54.0, 23.0]]}, "at least two waypoints"),
+        ({"waypoints": [[54.0, 23.0]] * 26}, "at most 25 waypoints"),
+        ({"waypoints": [[95.0, 23.0], [54.0, 23.0]]}, "out of range"),
+        ({"waypoints": [[54.0, 23.0], [54.1, 23.1]], "route_type": "scenic"}, "unknown route_type"),
+        ({"waypoints": [[54.0, 23.0], [54.1, 23.1]], "route_type": "free_flow"}, "only available for cycling"),
+        ({"waypoints": [[54.0, 23.0], [54.1, 23.1]], "activity_type": "swimming"}, "unknown activity_type"),
+    ],
+)
+async def test_create_course_from_waypoints_rejects_bad_input(
+    app_with_courses, mock_garmin_client, args, message
+):
+    result = await app_with_courses.call_tool(
+        "create_course_from_waypoints", {"course_name": "X", **args}
+    )
+
+    assert message in _result_text(result)
+    mock_garmin_client.client.post.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_course_from_waypoints_no_route(app_with_courses, mock_garmin_client):
+    mock_garmin_client.client.post.side_effect = _post_router(
+        legs=[{"route": []}], elevations=(), saved=None
+    )
+
+    result = await app_with_courses.call_tool(
+        "create_course_from_waypoints",
+        {"waypoints": [[54.0, 23.0], [54.1, 23.1]], "course_name": "X"},
+    )
+
+    assert "Garmin found no route" in _result_text(result)
+
+
+_LOOPS = {
+    "roundTripRouteCourses": [
+        {
+            "distanceMeter": 4501.3,
+            "elevationGainMeter": 84.6,
+            "elevationLossMeter": 84.0,
+            "geoPoints": [
+                {"latitude": 54.0, "longitude": 23.0, "elevation": 30.0, "distance": 0.0},
+                {"latitude": 54.01, "longitude": 23.01, "elevation": 40.0, "distance": 1.0},
+                {"latitude": 54.0, "longitude": 23.0, "elevation": 30.0, "distance": 2.0},
+            ],
+        },
+        {
+            "distanceMeter": 4687.0,
+            "elevationGainMeter": 120.6,
+            "elevationLossMeter": 120.0,
+            "geoPoints": [
+                {"latitude": 54.0, "longitude": 23.0, "elevation": 30.0},
+                {"latitude": 53.99, "longitude": 22.99, "elevation": 25.0},
+                {"latitude": 54.0, "longitude": 23.0, "elevation": 30.0},
+            ],
+        },
+    ]
+}
+
+
+@pytest.mark.asyncio
+async def test_create_round_trip_course_preview(app_with_courses, mock_garmin_client):
+    """save=false lists Garmin's loops with the resolved direction."""
+    mock_garmin_client.client.connectapi.return_value = _LOOPS
+
+    result = await app_with_courses.call_tool(
+        "create_round_trip_course",
+        {
+            "start_latitude": 54.0,
+            "start_longitude": 23.0,
+            "distance_km": 5,
+            "course_name": "Loop",
+            "direction": "tailwind",
+            "activity_type": "road_biking",
+            "route_type": "free_flow",
+            "save": False,
+        },
+    )
+
+    data = json.loads(_result_text(result))
+    assert data["status"] == "preview"
+    assert data["direction"] == "tailwind"
+    assert [a["distance_m"] for a in data["alternatives"]] == [4501.3, 4687.0]
+    path = mock_garmin_client.client.connectapi.call_args.args[0]
+    assert path.startswith("/course-service/course/roundTripRoutes/multiple?")
+    for part in ("distance=5000", "direction=TAILWIND", "courseType=ROAD_CYCLING", "routeType=FREE_FLOW"):
+        assert part in path
+    mock_garmin_client.client.post.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_round_trip_course_saves_chosen_alternative(app_with_courses, mock_garmin_client):
+    mock_garmin_client.client.connectapi.return_value = _LOOPS
+    mock_garmin_client.client.post.return_value = {"courseId": 9, "courseName": "Loop"}
+
+    result = await app_with_courses.call_tool(
+        "create_round_trip_course",
+        {
+            "start_latitude": 54.0,
+            "start_longitude": 23.0,
+            "distance_km": 5,
+            "course_name": "Loop",
+            "direction": "random",
+            "alternative": 2,
+        },
+    )
+
+    data = json.loads(_result_text(result))
+    assert data["course_id"] == 9
+    assert data["direction"] in ("north", "south", "east", "west")
+    payload = mock_garmin_client.client.post.call_args.kwargs["json"]
+    assert [p["latitude"] for p in payload["geoPoints"]] == [54.0, 53.99, 54.0]
+    assert payload["activityTypePk"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "args,message",
+    [
+        ({"route_type": "most_direct"}, "for a round trip"),
+        ({"direction": "up"}, "unknown direction"),
+        ({"distance_km": 0}, "distance_km must be between"),
+        ({"route_type": "free_flow"}, "only available for cycling"),
+        ({"start_latitude": 100}, "out of range"),
+    ],
+)
+async def test_create_round_trip_course_rejects_bad_input(
+    app_with_courses, mock_garmin_client, args, message
+):
+    base = {"start_latitude": 54.0, "start_longitude": 23.0, "distance_km": 5, "course_name": "X"}
+    result = await app_with_courses.call_tool("create_round_trip_course", {**base, **args})
+
+    assert message in _result_text(result)
+    mock_garmin_client.client.connectapi.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_round_trip_course_alternative_out_of_range(app_with_courses, mock_garmin_client):
+    mock_garmin_client.client.connectapi.return_value = _LOOPS
+
+    result = await app_with_courses.call_tool(
+        "create_round_trip_course",
+        {"start_latitude": 54.0, "start_longitude": 23.0, "distance_km": 5, "course_name": "X", "alternative": 3},
+    )
+
+    assert "alternative must be between 1 and 2" in _result_text(result)
+    mock_garmin_client.client.post.assert_not_called()
