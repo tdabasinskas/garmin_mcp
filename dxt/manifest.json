@@ -308,6 +308,10 @@
       "description": "Get information about the last used Garmin device"
     },
     {
+      "name": "get_device_message_queue",
+      "description": "List what Garmin Connect is waiting to send to your devices"
+    },
+    {
       "name": "get_device_settings",
       "description": "Get settings for a specific Garmin device"
     },
@@ -606,6 +610,10 @@
     {
       "name": "push_workout_to_device",
       "description": "Send a workout from the workout library to a Garmin device"
+    },
+    {
+      "name": "remove_device_message",
+      "description": "Take a workout or course off the queue before it reaches the device"
     },
     {
       "name": "remove_gear_from_activity",
