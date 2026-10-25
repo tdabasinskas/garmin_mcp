@@ -791,6 +791,8 @@ async def test_create_course_from_waypoints_routes_each_leg(app_with_courses, mo
     assert payload["courseName"] == "Old Town"
     assert payload["activityTypePk"] == 3
     assert [p["elevation"] for p in payload["geoPoints"]] == [10.0, 11.0, 12.0, 15.0]
+    assert payload["elevationGainMeter"] == 5.0
+    assert payload["elevationLossMeter"] == 0.0
 
 
 @pytest.mark.asyncio
@@ -951,6 +953,8 @@ async def test_create_round_trip_course_saves_chosen_alternative(app_with_course
     assert data["direction"] in ("north", "south", "east", "west")
     payload = mock_garmin_client.client.post.call_args.kwargs["json"]
     assert [p["latitude"] for p in payload["geoPoints"]] == [54.0, 53.99, 54.0]
+    assert payload["elevationGainMeter"] == 120.6
+    assert payload["elevationLossMeter"] == 120.0
     assert payload["activityTypePk"] == 1
 
 
