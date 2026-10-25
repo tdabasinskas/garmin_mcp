@@ -31,7 +31,7 @@ This MCP server implements **110+ tools** covering ~90% of the [python-garmincon
 - ✅ Health & Wellness (34 tools) - includes custom lightweight summary tools
 - ✅ Training & Performance (13 tools) - includes CTL/ATL/TSB, HRV, VO2 max, and respiration trends
 - ✅ Workouts (8 tools)
-- ✅ Devices (8 tools) - includes sending a workout to a device
+- ✅ Devices (9 tools) - includes sending a workout or a course to a device
 - ✅ Gear Management (5 tools)
 - ✅ Weight Tracking (5 tools)
 - ✅ Challenges & Badges (10 tools)
@@ -115,7 +115,7 @@ If you need any of these endpoints, please [open an issue](https://github.com/Ta
 
 ## Tool Filtering
 
-This server registers 159 tools by default, which is a lot of context for an
+This server registers 160 tools by default, which is a lot of context for an
 LLM to carry in every session. You can expose only the tools you need with
 three optional environment variables:
 
@@ -136,7 +136,7 @@ stops the server at startup with the list of known profiles.
 |---|---:|---|
 | `minimal` | 20 | Recent activities with splits, daily stats, sleep, HRV, stress, body battery, training readiness and status |
 | `health` | 53 | Every health_wellness tool plus weight, body composition, blood pressure, hydration, women's health, fitness age, HRV and respiration trends |
-| `activities` | 43 | Activity list, detail, splits and edits; FIT analysis and power curve; gear; courses |
+| `activities` | 44 | Activity list, detail, splits and edits; FIT analysis and power curve; gear; courses |
 | `workouts` | 26 | Workout library, upload, schedule and delete; the high-level builders; the calendar |
 | `training` | 38 | Training status, load, effect, VO2max, FTP, lactate threshold, endurance and hill scores, readiness, recovery time, personal records, race predictions, goals, badges |
 | `nutrition` | 23 | Food log, custom foods, daily nutrition settings, hydration, energy balance |
