@@ -202,6 +202,8 @@ _COURSE_POINT_TYPES = frozenset(
 # The Creator's limits; devices show at most 15 characters of a point's name.
 _COURSE_POINT_NAME_MAX = 15
 _COURSE_POINT_NOTE_MAX = 250
+# Rest breaks and cutoffs are stored in seconds; the Creator caps both at 99:59:59.
+_COURSE_POINT_DURATION_MAX_MINUTES = 359999 // 60
 # Garmin rejects longer course names and descriptions.
 _COURSE_NAME_MAX = 128
 _COURSE_DESCRIPTION_MAX = 512
@@ -230,6 +232,19 @@ class Waypoint(BaseModel):
     )
     note: Optional[str] = Field(
         None, max_length=_COURSE_POINT_NOTE_MAX, description="Course point description."
+    )
+    rest_minutes: Optional[int] = Field(
+        None,
+        ge=1,
+        le=_COURSE_POINT_DURATION_MAX_MINUTES,
+        description="Rest break: a compatible watch starts a rest timer this long on arrival.",
+    )
+    cutoff_minutes: Optional[int] = Field(
+        None,
+        ge=1,
+        le=_COURSE_POINT_DURATION_MAX_MINUTES,
+        description="Cutoff: time from the course start by which to reach this point; "
+        "a compatible watch counts down to it.",
     )
 
 
@@ -265,8 +280,10 @@ def _parse_course_point(item: Dict[str, Any]) -> Optional[Dict[str, str]]:
     """The course point a waypoint asks for (it has a name), or None."""
     name = (item.get("name") or "").strip()
     if not name:
-        if item.get("type") or item.get("note"):
-            raise ValueError("a waypoint with a type or note also needs a name")
+        if any(item.get(k) for k in ("type", "note", "rest_minutes", "cutoff_minutes")):
+            raise ValueError(
+                "a waypoint with a type, note, rest break or cutoff also needs a name"
+            )
         return None
     point_type = (item.get("type") or "GENERIC").strip().upper()
     if point_type not in _COURSE_POINT_TYPES:
@@ -282,7 +299,23 @@ def _parse_course_point(item: Dict[str, Any]) -> Optional[Dict[str, str]]:
         )
     if len(note) > _COURSE_POINT_NOTE_MAX:
         raise ValueError(f"a course point note is at most {_COURSE_POINT_NOTE_MAX} characters")
-    return {"name": name, "type": point_type, "note": note}
+    durations = {}
+    for key in ("rest_minutes", "cutoff_minutes"):
+        value = item.get(key)
+        if value is None:
+            continue
+        if not 1 <= int(value) <= _COURSE_POINT_DURATION_MAX_MINUTES:
+            raise ValueError(
+                f"{key} must be between 1 and {_COURSE_POINT_DURATION_MAX_MINUTES}"
+            )
+        durations[key] = int(value) * 60
+    return {
+        "name": name,
+        "type": point_type,
+        "note": note,
+        "rest_s": durations.get("rest_minutes"),
+        "cutoff_s": durations.get("cutoff_minutes"),
+    }
 
 
 def _parse_waypoints(waypoints: List[Any]) -> List[Dict[str, Any]]:
@@ -401,6 +434,8 @@ def _course_points(stops, stop_indexes, points) -> List[Dict[str, Any]]:
                 "lon": stop["longitude"],
                 "distance": round(cumulative[index], 1),
                 "elevation": points[index].get("elevation"),
+                "restDuration": wanted["rest_s"],
+                "cutoffDuration": wanted["cutoff_s"],
                 "timestamp": None,
                 "coursePointId": None,
             }
@@ -785,8 +820,10 @@ def register_tools(app):
                 becomes a course point, which the watch shows by name and
                 announces on approach; optional "type" (GENERIC by default,
                 e.g. WATER, FOOD, SUMMIT, ATTRACTION, PARK, COFFEE_SHOP,
-                DANGER) and "note" (at most 250 characters, a good place for
-                a longer name).
+                DANGER), "note" (at most 250 characters, a good place for
+                a longer name), "rest_minutes" (a rest break the watch times
+                on arrival) and "cutoff_minutes" (time from the start by
+                which to reach the point; the watch counts down to it).
             course_name: Name of the course. Max 128 characters.
             activity_type: One of running, trail_running, obstacle_run,
                 hiking, road_biking, gravel_cycling, mountain_biking or other.
@@ -844,6 +881,16 @@ def register_tools(app):
                                 "name": p["name"],
                                 "type": p["coursePointType"],
                                 "distance_m": p["distance"],
+                                **(
+                                    {"rest_minutes": p["restDuration"] // 60}
+                                    if p["restDuration"]
+                                    else {}
+                                ),
+                                **(
+                                    {"cutoff_minutes": p["cutoffDuration"] // 60}
+                                    if p["cutoffDuration"]
+                                    else {}
+                                ),
                             }
                             for p in course_points
                         ],
