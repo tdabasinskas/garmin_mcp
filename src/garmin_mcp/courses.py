@@ -61,16 +61,21 @@ def _initial_bearing(p1: Dict[str, float], p2: Dict[str, float]) -> float:
     return (initial_bearing + 360) % 360
 
 
-# Garmin Connect activity typeIds (see get_activity_types).
+# Garmin Connect activity typeIds (see get_activity_types) for the course
+# types the Course Creator offers.  Courses have no walking or generic cycling
+# type: the apps show those as "Other", so walking is saved as hiking and
+# cycling as road_biking, the Creator's choices for them.
 _ACTIVITY_TYPE_IDS = {
     "running": 1,
-    "cycling": 2,
+    "cycling": 10,  # road_biking
     "hiking": 3,
-    "walking": 9,
+    "walking": 3,  # hiking
     "trail_running": 6,
+    "obstacle_run": 154,
     "mountain_biking": 5,
     "road_biking": 10,
     "gravel_cycling": 143,
+    "other": 4,
 }
 
 
@@ -162,11 +167,13 @@ _ROUTE_TYPES = {
 _ROUND_TRIP_ROUTE_TYPES = ("popular", "least_elevation", "free_flow")
 _CYCLING_COURSE_TYPES = {"ROAD_CYCLING", "GRAVEL_BIKING", "MOUNTAIN_BIKING"}
 
-# activity_type -> routing courseType (the routing profile).  Garmin has no
-# walking profile, so walking routes as hiking.
+# activity_type -> routing courseType (the routing profile), as the Course
+# Creator picks it: walking routes as hiking and other as mixed surface.
 _ROUTING_COURSE_TYPES = {
     "running": "RUNNING",
     "trail_running": "TRAIL_RUNNING",
+    "obstacle_run": "RUNNING",
+    "other": "MIXED_SURFACE",
     "hiking": "HIKING",
     "walking": "HIKING",
     "cycling": "ROAD_CYCLING",
@@ -562,8 +569,10 @@ def register_tools(app):
             gpx_path: Absolute path to the .gpx file on disk.
             course_name: Override the course name. Defaults to the name parsed
                 from the GPX file. Max 128 characters; Garmin rejects longer.
-            activity_type: One of running, cycling, hiking, walking, trail_running,
-                mountain_biking, road_biking, gravel_cycling. Defaults to running.
+            activity_type: One of running, trail_running, obstacle_run, hiking,
+                road_biking, gravel_cycling, mountain_biking or other, the
+                Course Creator's types. walking is saved as hiking and cycling
+                as road_biking, since courses have neither. Defaults to running.
             description: Optional description shown on the course detail page.
                 Max 512 characters; Garmin rejects longer.
             gpx_base64: The GPX file's contents, base64-encoded, for clients
@@ -674,9 +683,10 @@ def register_tools(app):
                 or [{"latitude": .., "longitude": ..}, ...]; 2 to 25 points.
                 Repeat the start at the end for a loop.
             course_name: Name of the course. Max 128 characters.
-            activity_type: One of running, cycling, hiking, walking,
-                trail_running, mountain_biking, road_biking, gravel_cycling.
-                It also picks the routing profile (walking routes as hiking).
+            activity_type: One of running, trail_running, obstacle_run,
+                hiking, road_biking, gravel_cycling, mountain_biking or other.
+                walking is saved and routed as hiking, cycling as road_biking.
+                It also picks the routing profile.
             route_type: popular (Garmin's popularity routing, the Creator's
                 default), most_direct (shortest along roads), least_elevation,
                 free_flow (cycling only: fewer stops and turns) or freehand
@@ -757,8 +767,9 @@ def register_tools(app):
             distance_km: Wanted length in kilometres; Garmin's loops come out
                 near it, not exactly on it.
             course_name: Name of the course. Max 128 characters.
-            activity_type: One of running, cycling, hiking, walking,
-                trail_running, mountain_biking, road_biking, gravel_cycling.
+            activity_type: One of running, trail_running, obstacle_run,
+                hiking, road_biking, gravel_cycling, mountain_biking or other.
+                walking is saved and routed as hiking, cycling as road_biking.
             direction: north, south, east, west, tailwind (head out against
                 the wind, come back with it) or random.
             route_type: popular, least_elevation or free_flow (cycling only).
