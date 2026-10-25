@@ -1317,3 +1317,81 @@ async def test_push_course_to_device_error(app_with_devices, mock_garmin_client)
     data = json.loads(result[0][0].text)
     assert data["status"] == "failed"
     assert "API Error 404" in data["message"]
+
+
+_QUEUE = {
+    "numOfMessages": 2,
+    "messages": [
+        {
+            "messageId": 901,
+            "deviceId": 3456789012,
+            "messageType": "courses",
+            "metaData": {"messageName": "Old Town", "deviceName": "fenix 8", "fileType": "FIT", "metaDataId": 77},
+        },
+        {
+            "messageId": 902,
+            "deviceId": 1111,
+            "messageType": "workouts",
+            "metaData": {"messageName": "Easy Run", "deviceName": "Edge 540", "fileType": "FIT", "metaDataId": 5},
+        },
+    ],
+}
+
+
+@pytest.mark.asyncio
+async def test_get_device_message_queue_lists_pending(app_with_devices, mock_garmin_client):
+    mock_garmin_client.client.connectapi.return_value = _QUEUE
+
+    result = await app_with_devices.call_tool("get_device_message_queue", {"device_id": 3456789012})
+
+    data = json.loads(result[0][0].text)
+    assert data["pending_count"] == 1
+    assert data["pending"][0] == {
+        "message_id": 901,
+        "device_id": 3456789012,
+        "device_name": "fenix 8",
+        "type": "courses",
+        "name": "Old Town",
+        "file_type": "FIT",
+        "item_id": 77,
+    }
+    mock_garmin_client.client.connectapi.assert_called_with("/device-service/devicemessage/messages")
+
+
+@pytest.mark.asyncio
+async def test_get_device_message_queue_empty(app_with_devices, mock_garmin_client):
+    mock_garmin_client.client.connectapi.return_value = {"numOfMessages": 0, "messages": []}
+
+    result = await app_with_devices.call_tool("get_device_message_queue", {})
+
+    data = json.loads(result[0][0].text)
+    assert data["pending_count"] == 0
+    assert "reached the device" in data["message"]
+
+
+@pytest.mark.asyncio
+async def test_remove_device_message_preview_then_delete(app_with_devices, mock_garmin_client):
+    mock_garmin_client.client.connectapi.return_value = _QUEUE
+
+    preview = json.loads((await app_with_devices.call_tool("remove_device_message", {"message_id": 901}))[0][0].text)
+    assert preview["status"] == "needs_confirmation"
+    assert preview["item"]["name"] == "Old Town"
+    mock_garmin_client.client.delete.assert_not_called()
+
+    done = json.loads(
+        (await app_with_devices.call_tool("remove_device_message", {"message_id": 901, "confirm": True}))[0][0].text
+    )
+    assert done["status"] == "success"
+    mock_garmin_client.client.delete.assert_called_once_with(
+        "connectapi", "/device-service/devicemessage/message/901"
+    )
+
+
+@pytest.mark.asyncio
+async def test_remove_device_message_not_queued(app_with_devices, mock_garmin_client):
+    mock_garmin_client.client.connectapi.return_value = _QUEUE
+
+    result = await app_with_devices.call_tool("remove_device_message", {"message_id": 999, "confirm": True})
+
+    assert json.loads(result[0][0].text)["status"] == "not_found"
+    mock_garmin_client.client.delete.assert_not_called()

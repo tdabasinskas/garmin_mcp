@@ -532,4 +532,105 @@ def register_tools(app):
                 "message": f"Failed to push course: {str(e)}",
             }, indent=2)
 
+    @app.tool()
+    async def get_device_message_queue(device_id: Optional[int] = None) -> str:
+        """List what Garmin Connect is waiting to send to your devices
+
+        Workouts and courses sent with push_workout_to_device or
+        push_course_to_device (or "Send to Device" in the apps) wait here
+        until the device next syncs; an item that is gone has reached the
+        device. Software updates waiting to install are listed too.
+
+        Args:
+            device_id: Only list items for this device (optional)
+        """
+        try:
+            data = garmin_client.client.connectapi(
+                "/device-service/devicemessage/messages"
+            ) or {}
+            items = []
+            for message in data.get("messages") or []:
+                if device_id is not None and message.get("deviceId") != device_id:
+                    continue
+                meta = message.get("metaData") or {}
+                items.append({
+                    "message_id": message.get("messageId"),
+                    "device_id": message.get("deviceId"),
+                    "device_name": meta.get("deviceName"),
+                    "type": message.get("messageType"),
+                    "name": meta.get("messageName"),
+                    "file_type": meta.get("fileType"),
+                    "item_id": meta.get("metaDataId"),
+                })
+            return json.dumps(
+                {
+                    "pending_count": len(items),
+                    "pending": items,
+                    "message": (
+                        "Nothing is waiting; everything sent has reached the device."
+                        if not items
+                        else "These arrive on the device at its next sync."
+                    ),
+                },
+                indent=2,
+            )
+        except Exception as e:
+            return f"Error retrieving device message queue: {str(e)}"
+
+    @app.tool()
+    async def remove_device_message(message_id: int, confirm: bool = False) -> str:
+        """Take a workout or course off the queue before it reaches the device
+
+        Use it to cancel a push sent twice or by mistake. Items that already
+        reached the device are no longer in the queue and cannot be pulled
+        back this way. Call once with confirm=false (the default) to preview,
+        then again with confirm=true to remove it.
+
+        Args:
+            message_id: ID of the queued item (from get_device_message_queue)
+            confirm: Must be true to actually remove. Default false returns a preview.
+        """
+        try:
+            data = garmin_client.client.connectapi(
+                "/device-service/devicemessage/messages"
+            ) or {}
+            message = next(
+                (m for m in data.get("messages") or [] if m.get("messageId") == message_id),
+                None,
+            )
+            if message is None:
+                return json.dumps({
+                    "status": "not_found",
+                    "message_id": message_id,
+                    "message": (
+                        "No queued item with this ID; it may already have "
+                        "reached the device."
+                    ),
+                }, indent=2)
+            meta = message.get("metaData") or {}
+            preview = {
+                "message_id": message_id,
+                "device_id": message.get("deviceId"),
+                "device_name": meta.get("deviceName"),
+                "type": message.get("messageType"),
+                "name": meta.get("messageName"),
+            }
+            if not confirm:
+                return json.dumps({
+                    "status": "needs_confirmation",
+                    "item": preview,
+                    "message": "Call again with confirm=true to take this off the queue.",
+                }, indent=2)
+
+            garmin_client.client.delete(
+                "connectapi", f"/device-service/devicemessage/message/{message_id}"
+            )
+            return json.dumps({
+                "status": "success",
+                "item": preview,
+                "message": f"Removed {preview['name']!r} from the queue",
+            }, indent=2)
+        except Exception as e:
+            return f"Error removing device message: {str(e)}"
+
     return app
