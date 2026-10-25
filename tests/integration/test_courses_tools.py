@@ -951,3 +951,83 @@ async def test_create_round_trip_course_activity_types(
 
     assert f"courseType={course_type}" in mock_garmin_client.client.connectapi.call_args.args[0]
     assert mock_garmin_client.client.post.call_args.kwargs["json"]["activityTypePk"] == type_id
+
+
+# --- named waypoints become course points -----------------------------------
+
+@pytest.mark.asyncio
+async def test_create_course_from_waypoints_named_course_points(app_with_courses, mock_garmin_client):
+    """Named waypoints become course points at their distance along the route."""
+    mock_garmin_client.client.post.side_effect = _post_router(
+        legs=[
+            _leg((54.0, 23.0), (54.001, 23.0), (54.002, 23.0)),
+            _leg((54.002, 23.0), (54.003, 23.0)),
+        ],
+        elevations=(10.0, 11.0, 12.0, 13.0),
+        saved={"courseId": 8, "coursePoints": [{}, {}]},
+    )
+
+    result = await app_with_courses.call_tool(
+        "create_course_from_waypoints",
+        {
+            "waypoints": [
+                {"lat": 54.0, "lon": 23.0, "name": "Start"},
+                {"lat": 54.0021, "lon": 23.0001, "name": "Pažaislio vienuolynas", "type": "attraction"},
+                [54.003, 23.0],
+            ],
+            "course_name": "POI walk",
+        },
+    )
+
+    data = json.loads(_result_text(result))
+    assert data["course_points_count"] == 2
+    points = mock_garmin_client.client.post.call_args_list[-1].kwargs["json"]["coursePoints"]
+    assert [p["name"] for p in points] == ["Start", "Pažaislio vienu"]
+    assert points[1]["coursePointType"] == "ATTRACTION"
+    assert points[1]["note"] == "Pažaislio vienuolynas"
+    assert points[1]["lat"] == 54.0021  # the stop's own position, not the snapped one
+    assert points[0]["distance"] == 0.0
+    assert 220 < points[1]["distance"] < 225  # end of the first leg
+    assert points[1]["elevation"] == 12.0
+    assert points[0]["coursePointType"] == "GENERIC"
+
+
+@pytest.mark.asyncio
+async def test_create_course_from_waypoints_preview_lists_course_points(app_with_courses, mock_garmin_client):
+    mock_garmin_client.client.post.side_effect = _post_router(
+        legs=[], elevations=(1.0, 2.0), saved=None
+    )
+
+    result = await app_with_courses.call_tool(
+        "create_course_from_waypoints",
+        {
+            "waypoints": [[54.0, 23.0], {"lat": 54.01, "lon": 23.0, "name": "Water", "type": "WATER", "note": "Tap by the gate"}],
+            "course_name": "X",
+            "route_type": "freehand",
+            "save": False,
+        },
+    )
+
+    data = json.loads(_result_text(result))
+    assert data["course_points"] == [{"name": "Water", "type": "WATER", "distance_m": data["distance_m"]}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "waypoint,message",
+    [
+        ({"lat": 54.1, "lon": 23.1, "name": "X", "type": "CASTLE"}, "unknown course point type 'CASTLE'"),
+        ({"lat": 54.1, "lon": 23.1, "type": "WATER"}, "also needs a name"),
+        ({"lat": 54.1, "lon": 23.1, "name": "X", "note": "n" * 251}, "at most 250 characters"),
+    ],
+)
+async def test_create_course_from_waypoints_rejects_bad_course_points(
+    app_with_courses, mock_garmin_client, waypoint, message
+):
+    result = await app_with_courses.call_tool(
+        "create_course_from_waypoints",
+        {"waypoints": [[54.0, 23.0], waypoint], "course_name": "X"},
+    )
+
+    assert message in _result_text(result)
+    mock_garmin_client.client.post.assert_not_called()
