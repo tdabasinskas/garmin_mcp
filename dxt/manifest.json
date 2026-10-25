@@ -92,12 +92,20 @@
       "description": "Get total count of activities in the user's Garmin account"
     },
     {
+      "name": "create_course_from_waypoints",
+      "description": "Create a Garmin Connect Course routed through waypoints"
+    },
+    {
       "name": "create_custom_food",
       "description": "Create a custom food in the user's Garmin nutrition library"
     },
     {
       "name": "create_manual_activity",
       "description": "Log a manual activity in Garmin Connect \u2014 useful for activities done without a watch."
+    },
+    {
+      "name": "create_round_trip_course",
+      "description": "Create a loop course of about a given length from a start point"
     },
     {
       "name": "create_run_interval_workout",

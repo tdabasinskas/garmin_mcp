@@ -1,6 +1,6 @@
 """Built-in tool profiles for GARMIN_TOOL_PROFILE.
 
-The server registers 155 tools. A profile narrows that to one area so an LLM
+The server registers 159 tools. A profile narrows that to one area so an LLM
 client carries less context, without the user having to list tool names in
 GARMIN_ENABLED_TOOLS. Each profile is a set of registered tool names; a unit
 test checks every name here against the tools the modules actually register,
@@ -134,6 +134,8 @@ ACTIVITIES_TOOLS = CORE_TOOLS | frozenset(
         "get_gear",
         "remove_gear_from_activity",
         # courses
+        "create_course_from_waypoints",
+        "create_round_trip_course",
         "delete_course",
         "download_course_gpx",
         "get_course_details",
