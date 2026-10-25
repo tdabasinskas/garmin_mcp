@@ -185,6 +185,27 @@ _ROUTING_COURSE_TYPES = {
 _ROUND_TRIP_DIRECTIONS = ("north", "south", "east", "west", "tailwind")
 _MAX_WAYPOINTS = 25
 
+# Course point types the Course Creator offers
+# (connect.garmin.com/web-data/course-points/coursePointsData.json), minus the
+# start/finish markers and generated distance markers it adds itself.
+_COURSE_POINT_TYPES = frozenset(
+    """
+    GENERIC INFO SERVICE
+    AID_STATION FIRST_AID FOOD WATER ENERGY_GEL SPORTS_DRINK
+    SPRINT HORS_CATEGORY FIRST_CATEGORY SECOND_CATEGORY THIRD_CATEGORY FOURTH_CATEGORY
+    TOILET SHOWER GEAR NAVAID TRANSPORT
+    TRANSITION CHECKPOINT MEETING_SPOT CAMPSITE SHELTER REST_AREA RACE_OBSTACLE_START
+    RACE_OBSTACLE_END SUMMIT TUNNEL BRIDGE VALLEY OVERLOOK STORE
+    ALERT DANGER OBSTACLE CROSSING STEEP_INCLINE SHARP_CURVE
+    CONVENIENCE RESTROOM WATER_STOP COFFEE_SHOP BIKE_SHOP_AND_REPAIR PARK WINERY_OR_BREWERY
+    BANK_OR_ATM RESTAURANT EMERGENCY RECREATION ATTRACTION LODGING TRANSPORTATION SHOPPING
+    COMMUNITY
+    """.split()
+)
+# The Creator's limits; devices show at most 15 characters of a point's name.
+_COURSE_POINT_NAME_MAX = 15
+_COURSE_POINT_NOTE_MAX = 250
+
 
 def _avoid_params(
     avoid_unpaved_roads: bool, avoid_high_traffic_roads: bool, avoid_road_closures: bool
@@ -214,13 +235,42 @@ def _check_route_options(activity_type: str, route_type: str) -> tuple:
     return activity_type_id, course_type
 
 
-def _parse_waypoints(waypoints: List[Any]) -> List[Dict[str, float]]:
-    """Accept [[lat, lon], ...] or [{"latitude"/"lat", "longitude"/"lon"}, ...]."""
+def _parse_course_point(item: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """The course point a waypoint asks for (it has a name), or None."""
+    name = (item.get("name") or "").strip()
+    if not name:
+        if item.get("type") or item.get("note"):
+            raise ValueError("a waypoint with a type or note also needs a name")
+        return None
+    point_type = (item.get("type") or "GENERIC").strip().upper()
+    if point_type not in _COURSE_POINT_TYPES:
+        raise ValueError(
+            f"unknown course point type '{point_type}'. "
+            f"Supported: {', '.join(sorted(_COURSE_POINT_TYPES))}."
+        )
+    note = (item.get("note") or "").strip()
+    if len(name) > _COURSE_POINT_NAME_MAX:
+        # Keep the full name where the device can still show it.
+        note = f"{name}. {note}" if note else name
+        name = name[:_COURSE_POINT_NAME_MAX].rstrip()
+    if len(note) > _COURSE_POINT_NOTE_MAX:
+        raise ValueError(f"a course point note is at most {_COURSE_POINT_NOTE_MAX} characters")
+    return {"name": name, "type": point_type, "note": note}
+
+
+def _parse_waypoints(waypoints: List[Any]) -> List[Dict[str, Any]]:
+    """Accept [[lat, lon], ...] or [{"latitude"/"lat", "longitude"/"lon"}, ...].
+
+    A dict waypoint with a "name" (and optional "type" and "note") also
+    becomes a course point; it is returned under "course_point".
+    """
     points = []
     for item in waypoints:
+        course_point = None
         if isinstance(item, dict):
             lat = item.get("latitude", item.get("lat"))
             lon = item.get("longitude", item.get("lon", item.get("lng")))
+            course_point = _parse_course_point(item)
         elif isinstance(item, (list, tuple)) and len(item) >= 2:
             lat, lon = item[0], item[1]
         else:
@@ -228,7 +278,10 @@ def _parse_waypoints(waypoints: List[Any]) -> List[Dict[str, float]]:
         lat, lon = float(lat), float(lon)
         if not (-90 <= lat <= 90 and -180 <= lon <= 180):
             raise ValueError(f"waypoint ({lat}, {lon}) is out of range")
-        points.append({"latitude": lat, "longitude": lon})
+        point = {"latitude": lat, "longitude": lon}
+        if course_point:
+            point["course_point"] = course_point
+        points.append(point)
     if len(points) < 2:
         raise ValueError("at least two waypoints (start and end) are needed")
     if len(points) > _MAX_WAYPOINTS:
@@ -295,6 +348,38 @@ def _route_summary(points: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _course_points(stops, stop_indexes, points) -> List[Dict[str, Any]]:
+    """Course points for the named stops, placed at their distance along the route.
+
+    stop_indexes[i] is the index in points where stop i's leg starts or ends.
+    The point keeps the stop's own position, as the Creator does for a point
+    placed beside the line.
+    """
+    cumulative = [0.0]
+    for i in range(1, len(points)):
+        cumulative.append(cumulative[-1] + _haversine(points[i - 1], points[i]))
+    result = []
+    for stop, index in zip(stops, stop_indexes):
+        wanted = stop.get("course_point")
+        if not wanted:
+            continue
+        result.append(
+            {
+                "name": wanted["name"],
+                "coursePointType": wanted["type"],
+                "note": wanted["note"] or None,
+                "lat": stop["latitude"],
+                "lon": stop["longitude"],
+                "distance": round(cumulative[index], 1),
+                "elevation": points[index].get("elevation"),
+                "timestamp": None,
+                "coursePointId": None,
+            }
+        )
+    result.sort(key=lambda p: p["distance"])
+    return result
+
+
 def _save_course(
     client,
     points,
@@ -303,6 +388,7 @@ def _save_course(
     description,
     elevation_gain: Optional[float] = None,
     elevation_loss: Optional[float] = None,
+    course_points: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Save routed points as a course.  Garmin stores the climb it is sent
     rather than working it out, so it is filled in here."""
@@ -318,6 +404,7 @@ def _save_course(
     )
     payload["elevationGainMeter"] = elevation_gain
     payload["elevationLossMeter"] = elevation_loss
+    payload["coursePoints"] = course_points or []
     saved = client.client.post("connectapi", "/course-service/course", json=payload, api=True)
     return {
         "status": "success",
@@ -327,6 +414,7 @@ def _save_course(
         "elevation_gain_m": saved.get("elevationGainMeter"),
         "elevation_loss_m": saved.get("elevationLossMeter"),
         "activity_type_id": saved.get("activityTypePk"),
+        "course_points_count": len(saved.get("coursePoints") or []),
         "url": f"https://connect.{client.client.domain}/modern/course/{saved.get('courseId')}",
     }
 
@@ -681,7 +769,13 @@ def register_tools(app):
         Args:
             waypoints: Start, optional via points and end, as [[lat, lon], ...]
                 or [{"latitude": .., "longitude": ..}, ...]; 2 to 25 points.
-                Repeat the start at the end for a loop.
+                Repeat the start at the end for a loop. A dict waypoint with
+                a "name" also becomes a course point, which the watch shows by
+                name and announces on approach; optional "type" (GENERIC by
+                default, e.g. WATER, FOOD, SUMMIT, ATTRACTION, COFFEE_SHOP,
+                DANGER) and "note" (up to 250 characters). Devices show 15
+                characters of a name; a longer one is cut there and kept in
+                full in the note.
             course_name: Name of the course. Max 128 characters.
             activity_type: One of running, trail_running, obstacle_run,
                 hiking, road_biking, gravel_cycling, mountain_biking or other.
@@ -709,12 +803,14 @@ def register_tools(app):
             stops = _parse_waypoints(waypoints)
 
             if route_type == "freehand":
-                points = [dict(p) for p in stops]
+                points = [{"latitude": p["latitude"], "longitude": p["longitude"]} for p in stops]
+                stop_indexes = list(range(len(stops)))
             else:
                 avoid = _avoid_params(
                     avoid_unpaved_roads, avoid_high_traffic_roads, avoid_road_closures
                 )
                 points = []
+                stop_indexes = [0]
                 for start, end in zip(stops, stops[1:]):
                     leg = _route_leg(
                         garmin_client, start, end, _ROUTE_TYPES[route_type], course_type, avoid
@@ -722,15 +818,36 @@ def register_tools(app):
                     if points and leg and points[-1] == leg[0]:
                         leg = leg[1:]
                     points.extend(leg)
+                    stop_indexes.append(len(points) - 1)
             points = _with_elevation(garmin_client, points)
+            course_points = _course_points(stops, stop_indexes, points)
 
             if not save:
                 return json.dumps(
-                    {"status": "preview", "name": course_name, **_route_summary(points)},
+                    {
+                        "status": "preview",
+                        "name": course_name,
+                        **_route_summary(points),
+                        "course_points": [
+                            {
+                                "name": p["name"],
+                                "type": p["coursePointType"],
+                                "distance_m": p["distance"],
+                            }
+                            for p in course_points
+                        ],
+                    },
                     indent=2,
                 )
             return json.dumps(
-                _save_course(garmin_client, points, course_name, activity_type_id, description),
+                _save_course(
+                    garmin_client,
+                    points,
+                    course_name,
+                    activity_type_id,
+                    description,
+                    course_points=course_points,
+                ),
                 indent=2,
             )
         except ValueError as e:
