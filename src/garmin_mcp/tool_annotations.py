@@ -82,7 +82,12 @@ DESTRUCTIVE_TOOLS = frozenset(
 # arguments. Batch scheduling can also upload an inline workout, so it is
 # intentionally excluded even though its existing-workout path is guarded.
 IDEMPOTENT_TOOLS = frozenset(
-    {"reschedule_workout", "schedule_week", "schedule_workout"}
+    {
+        "remove_device_message",
+        "reschedule_workout",
+        "schedule_week",
+        "schedule_workout",
+    }
 )
 
 
