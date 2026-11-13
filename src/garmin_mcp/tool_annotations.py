@@ -100,6 +100,7 @@ IDEMPOTENT_TOOLS = frozenset(
         "download_activity_file",
         "download_course_gpx",
         "download_workout",
+        "remove_device_message",
         "remove_gear_from_activity",
         "request_reload",
         "reschedule_workout",
